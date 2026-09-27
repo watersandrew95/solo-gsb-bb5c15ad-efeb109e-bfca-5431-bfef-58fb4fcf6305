@@ -10,6 +10,8 @@ from .schemas import (
     STANDARD_ANNUAL_LIMITS,
     CoverageGapOut,
     ExhibitBudgetOut,
+    IntervalAttributionItemOut,
+    IntervalAttributionOut,
     LightingPreviewExhibitOut,
     OpenHoursCoverageDayOut,
     OpenHoursCoverageIn,
@@ -20,6 +22,7 @@ from .schemas import (
 )
 from .timeline import (
     Segment,
+    attribute_exposure,
     coverage_gaps,
     day_bounds,
     days_in_year,
@@ -343,4 +346,35 @@ def build_open_hours_coverage(
         open_end=request.open_end,
         min_lux=request.min_lux,
         days=days,
+    )
+
+
+def build_interval_attribution(
+    showcase: sqlite3.Row,
+    intervals: list[tuple[int, datetime, datetime, float]],
+    start: datetime,
+    end: datetime,
+) -> IntervalAttributionOut:
+    """把 [start, end) 窗口内的有效曝光归因到各条相交照明区间（只读，不落库）。
+
+    相交区间裁剪到窗口后按所有起止点切片，每片有效照度取最大值并平分给
+    并列最亮（且大于零）的区间；较暗区间不获归因，只累计被遮蔽小时数。
+    窗口内无相交区间时总量为零、列表为空。
+    """
+    start, end = parse_utc(start), parse_utc(end)
+    total, per_interval = attribute_exposure(intervals, start, end)
+    return IntervalAttributionOut(
+        showcase_id=showcase["id"],
+        showcase_name=showcase["name"],
+        start=start,
+        end=end,
+        total_lux_hours=_r(total),
+        intervals=[
+            IntervalAttributionItemOut(
+                interval_id=iv_id,
+                attributed_lux_hours=_r(attributed),
+                shadowed_hours=_r(shadowed),
+            )
+            for iv_id, (attributed, shadowed) in sorted(per_interval.items())
+        ],
     )

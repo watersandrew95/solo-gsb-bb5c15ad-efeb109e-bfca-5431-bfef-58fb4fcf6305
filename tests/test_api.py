@@ -814,3 +814,159 @@ def test_open_hours_coverage_read_only_and_tz_normalized(client):
     assert client.get(
         f"/api/v1/showcases/{case_id}/budget?day=2026-03-01").json() == before_budget
     assert client.get(f"/api/v1/showcases/{case_id}/intervals").json() == before_intervals
+
+
+# ------------------------------------------------------------- 区间曝光归因
+
+def _post_attribution(client, case_id, **overrides):
+    payload = {"start": "2026-03-01T09:00:00Z", "end": "2026-03-01T13:00:00Z"}
+    payload.update(overrides)
+    return client.post(f"/api/v1/showcases/{case_id}/interval-attribution", json=payload)
+
+
+def test_interval_attribution_basic(client):
+    """窗口 09:00-13:00；A 08-12 @50、B 10-14 @200、C 11-13 @200。
+
+    切片：09-10 A 独占 50；10-11 B 最亮 200（A 被遮蔽）；11-12 B/C 并列最亮
+    平分 200（A 被遮蔽）；12-13 B/C 平分 200（B 跨界裁剪到 13:00）。
+    总量 650；A 归因 50/遮蔽 2h，B 归因 400，C 归因 200。
+    """
+    case_id = _create_case(client, name="归因柜")
+    r = client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            {"start": "2026-03-01T08:00:00Z", "end": "2026-03-01T12:00:00Z", "lux": 50},
+            {"start": "2026-03-01T10:00:00Z", "end": "2026-03-01T14:00:00Z", "lux": 200},
+            {"start": "2026-03-01T11:00:00Z", "end": "2026-03-01T13:00:00Z", "lux": 200},
+        ]},
+    )
+    assert r.status_code == 201, r.text
+    ids = [iv["id"] for iv in r.json()]
+
+    r = _post_attribution(client, case_id)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["showcase_id"] == case_id
+    assert body["showcase_name"] == "归因柜"
+    assert body["start"].startswith("2026-03-01T09:00:00")
+    assert body["end"].startswith("2026-03-01T13:00:00")
+    assert body["total_lux_hours"] == 650.0
+    items = body["intervals"]
+    assert [it["interval_id"] for it in items] == ids  # 按 ID 排序
+    assert items[0]["attributed_lux_hours"] == 50.0
+    assert items[0]["shadowed_hours"] == 2.0
+    assert items[1]["attributed_lux_hours"] == 400.0
+    assert items[1]["shadowed_hours"] == 0.0
+    assert items[2]["attributed_lux_hours"] == 200.0
+    assert items[2]["shadowed_hours"] == 0.0
+
+
+def test_interval_attribution_empty_result(client):
+    """无区间或区间与窗口不相交：总量为零、列表为空。"""
+    case_id = _create_case(client, name="空归因柜")
+    r = _post_attribution(client, case_id)
+    assert r.status_code == 200, r.text
+    assert r.json()["total_lux_hours"] == 0.0
+    assert r.json()["intervals"] == []
+
+    client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            {"start": "2026-03-05T08:00:00Z", "end": "2026-03-05T10:00:00Z", "lux": 50}
+        ]},
+    )
+    r = _post_attribution(client, case_id)
+    assert r.json()["total_lux_hours"] == 0.0
+    assert r.json()["intervals"] == []
+
+
+def test_interval_attribution_zero_lux_and_fully_shadowed(client):
+    """0 lux 区间不获归因；较暗区间全程被遮蔽时归因 0、遮蔽计满。"""
+    case_id = _create_case(client, name="零照度归因柜")
+    r = client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            {"start": "2026-03-01T09:00:00Z", "end": "2026-03-01T13:00:00Z", "lux": 0},
+            {"start": "2026-03-01T10:00:00Z", "end": "2026-03-01T12:00:00Z", "lux": 30},
+            {"start": "2026-03-01T10:00:00Z", "end": "2026-03-01T12:00:00Z", "lux": 100},
+        ]},
+    )
+    ids = [iv["id"] for iv in r.json()]
+
+    r = _post_attribution(client, case_id)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["total_lux_hours"] == 200.0  # 仅 10-12 @100 产生有效曝光
+    items = body["intervals"]
+    assert [it["interval_id"] for it in items] == ids
+    # 0 lux：09-10 与 12-13 单独覆盖不获归因；10-12 被 100 lux 遮蔽 2h
+    assert items[0]["attributed_lux_hours"] == 0.0
+    assert items[0]["shadowed_hours"] == 2.0
+    # 30 lux：全程被 100 lux 遮蔽，不获归因
+    assert items[1]["attributed_lux_hours"] == 0.0
+    assert items[1]["shadowed_hours"] == 2.0
+    assert items[2]["attributed_lux_hours"] == 200.0
+    assert items[2]["shadowed_hours"] == 0.0
+
+
+def test_interval_attribution_validation(client):
+    """反向 / 零长度 / 超过 31 天（含时区归一化后）→ 422；未知展柜 → 404。"""
+    case_id = _create_case(client, name="归因校验柜")
+
+    # 反向窗口
+    r = _post_attribution(client, case_id,
+                          start="2026-03-02T08:00:00Z", end="2026-03-01T08:00:00Z")
+    assert r.status_code == 422 and "结束时间" in r.text
+    # 零长度窗口
+    r = _post_attribution(client, case_id,
+                          start="2026-03-01T08:00:00Z", end="2026-03-01T08:00:00Z")
+    assert r.status_code == 422
+    # 超过 31 天（03-01 → 04-02 共 32 天）
+    r = _post_attribution(client, case_id,
+                          start="2026-03-01T00:00:00Z", end="2026-04-02T00:00:00Z")
+    assert r.status_code == 422 and "31 天" in r.text
+    # 恰好 31 天（03-01 → 04-01）→ 通过
+    r = _post_attribution(client, case_id,
+                          start="2026-03-01T00:00:00Z", end="2026-04-01T00:00:00Z")
+    assert r.status_code == 200, r.text
+    # 带时区提交，归一化到 UTC 后超窗：04-01 16:00 (+08:00) → UTC 04-01 08:00，共 31 天 8 小时
+    r = _post_attribution(client, case_id,
+                          start="2026-03-01T00:00:00Z", end="2026-04-01T16:00:00+08:00")
+    assert r.status_code == 422 and "31 天" in r.text
+    # 未知展柜
+    r = _post_attribution(client, 4242)
+    assert r.status_code == 404
+
+
+def test_interval_attribution_read_only_and_tz_normalized(client):
+    """naive 时间视为 UTC、带时区时间归一化为 UTC 返回；全程只读不改库。"""
+    case_id = _create_case(client, name="归因只读柜")
+    client.post(
+        f"/api/v1/showcases/{case_id}/exhibits",
+        json={"name": "绢画", "sensitivity": "high", "annual_limit_lux_hours": 1000},
+    )
+    client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            {"start": "2026-03-01T08:00:00Z", "end": "2026-03-01T18:00:00Z", "lux": 50}
+        ]},
+    )
+    before_budget = client.get(
+        f"/api/v1/showcases/{case_id}/budget?day=2026-03-01").json()
+    before_intervals = client.get(f"/api/v1/showcases/{case_id}/intervals").json()
+
+    # naive 起 + 带时区止：2026-03-01 21:00 (+08:00) → UTC 2026-03-01 13:00
+    r = _post_attribution(client, case_id,
+                          start="2026-03-01T09:00:00", end="2026-03-01T21:00:00+08:00")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["start"].startswith("2026-03-01T09:00:00")
+    assert body["end"].startswith("2026-03-01T13:00:00")
+    assert body["start"].endswith(("+00:00", "Z"))
+    assert body["end"].endswith(("+00:00", "Z"))
+    assert body["total_lux_hours"] == 200.0  # 09:00-13:00 × 50 lux
+
+    # 只读：预算与已存区间均不变
+    assert client.get(
+        f"/api/v1/showcases/{case_id}/budget?day=2026-03-01").json() == before_budget
+    assert client.get(f"/api/v1/showcases/{case_id}/intervals").json() == before_intervals

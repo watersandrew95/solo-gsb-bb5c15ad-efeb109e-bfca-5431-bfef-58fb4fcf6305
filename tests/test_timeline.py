@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.timeline import (
     Segment,
+    attribute_exposure,
     clip_segments,
     coverage_gaps,
     first_exceed_time,
@@ -132,3 +133,52 @@ def test_coverage_gaps_clips_cross_day_segment_to_window():
     gaps, compliant = coverage_gaps(segs, _dt(8, day=2), _dt(12, day=2), 50)
     assert gaps == [(_dt(10, day=2), _dt(12, day=2))]
     assert compliant == 2.0
+
+
+# ------------------------------------------------------------- 区间曝光归因
+
+def test_attribute_exposure_disjoint_intervals():
+    intervals = [(1, _dt(0), _dt(2), 50), (2, _dt(4), _dt(6), 100)]
+    total, per = attribute_exposure(intervals, _dt(0), _dt(6))
+    assert total == 50 * 2 + 100 * 2
+    assert per == {1: (100.0, 0.0), 2: (200.0, 0.0)}
+
+
+def test_attribute_exposure_overlap_max_and_tie_split():
+    # A 08-12 @50；B 10-14 @200；C 11-13 @200（与 B 并列最亮平分）
+    intervals = [
+        (1, _dt(8), _dt(12), 50),
+        (2, _dt(10), _dt(14), 200),
+        (3, _dt(11), _dt(13), 200),
+    ]
+    total, per = attribute_exposure(intervals, _dt(9), _dt(13))
+    # 切片 09-10：A 独占 50；10-11：B 最亮 200（A 被遮蔽）；
+    # 11-12：B/C 并列平分 200（A 被遮蔽）；12-13：B/C 平分 200
+    assert total == 650.0
+    assert per[1] == (50.0, 2.0)    # 独占 1h；10-12 被遮蔽 2h
+    assert per[2] == (400.0, 0.0)   # 10-11 独占 200 + 11-13 平分各 100
+    assert per[3] == (200.0, 0.0)
+
+
+def test_attribute_exposure_clips_to_window():
+    # 跨界区间仅窗口内部分参与归因
+    total, per = attribute_exposure(
+        [(1, _dt(20), _dt(10, day=2), 80)], _dt(8, day=2), _dt(12, day=2)
+    )
+    assert total == 160.0
+    assert per == {1: (160.0, 0.0)}
+
+
+def test_attribute_exposure_empty_window():
+    total, per = attribute_exposure([], _dt(0), _dt(6))
+    assert total == 0.0
+    assert per == {}
+
+
+def test_attribute_exposure_zero_lux_no_attribution():
+    # 0 lux 区间单独覆盖时不获归因；被更亮区间覆盖的时长计为被遮蔽
+    intervals = [(1, _dt(0), _dt(4), 0), (2, _dt(1), _dt(3), 50)]
+    total, per = attribute_exposure(intervals, _dt(0), _dt(4))
+    assert total == 100.0
+    assert per[1] == (0.0, 2.0)
+    assert per[2] == (100.0, 0.0)

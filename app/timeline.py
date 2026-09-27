@@ -133,6 +133,55 @@ def coverage_gaps(
     return gaps, compliant_hours
 
 
+def attribute_exposure(
+    intervals: list[tuple[int, datetime, datetime, float]],
+    window_start: datetime,
+    window_end: datetime,
+) -> tuple[float, dict[int, tuple[float, float]]]:
+    """把 [window_start, window_end) 窗口内的有效曝光归因到各照明区间。
+
+    相交区间先裁剪到窗口内，再按所有起止点切片；每片有效照度取最大值，
+    该片有效 lux·hour 平分给照度并列最高且大于零的区间；较暗区间不获归因，
+    其被更亮区间覆盖的片长计入该区间"被遮蔽小时数"。
+
+    返回 ``(窗口有效曝光总量, {区间ID: (归因 lux·hour, 被遮蔽小时数)})``；
+    窗口内无区间时总量为 0、映射为空。并列/遮蔽判断与 merge_intervals 一致，
+    对库存照度值做精确比较（照度原样存取，无累计误差）。
+    """
+    window_start, window_end = parse_utc(window_start), parse_utc(window_end)
+    clipped: list[tuple[int, datetime, datetime, float]] = []
+    for iv_id, start, end, lux in intervals:
+        s = max(parse_utc(start), window_start)
+        e = min(parse_utc(end), window_end)
+        if e > s:
+            clipped.append((iv_id, s, e, lux))
+
+    points = sorted({p for _, s, e, _ in clipped for p in (s, e)})
+    attributed = {iv_id: 0.0 for iv_id, *_ in clipped}
+    shadowed = {iv_id: 0.0 for iv_id, *_ in clipped}
+    total = 0.0
+
+    for s, e in zip(points, points[1:]):
+        covering = [(iv_id, lux) for iv_id, cs, ce, lux in clipped if cs <= s and ce >= e]
+        if not covering:
+            continue
+        max_lux = max(lux for _, lux in covering)
+        if max_lux <= 0:
+            continue  # 并列最高照度不大于零：全片无归因
+        hours = hours_between(s, e)
+        exposure = max_lux * hours
+        total += exposure
+        winners = [iv_id for iv_id, lux in covering if lux == max_lux]
+        share = exposure / len(winners)
+        for iv_id in winners:
+            attributed[iv_id] += share
+        for iv_id, lux in covering:
+            if lux < max_lux:
+                shadowed[iv_id] += hours
+
+    return total, {iv_id: (attributed[iv_id], shadowed[iv_id]) for iv_id in attributed}
+
+
 def integrate(segments: list[Segment]) -> float:
     """累计 lux·hour。"""
     return sum(seg.lux * hours_between(seg.start, seg.end) for seg in segments)

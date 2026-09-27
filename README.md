@@ -227,6 +227,33 @@ curl -s -X POST localhost:8000/api/v1/showcases/1/open-hours-coverage \
 }
 ```
 
+区间曝光归因（不落库）：把 9-18 10:00–14:00 窗口内的有效曝光归因到各条照明区间——
+按所有起止点切片后每片取最大照度，该片 lux·hour 平分给并列最亮的区间，较暗区间
+只累计被遮蔽小时数：
+
+```bash
+curl -s -X POST localhost:8000/api/v1/showcases/1/interval-attribution \
+  -H 'Content-Type: application/json' \
+  -d '{"start": "2026-09-18T10:00:00Z", "end": "2026-09-18T14:00:00Z"}'
+```
+
+响应示例（窗口切片 10:00–12:00 / 12:00–13:00 / 13:00–14:00；仅 12:00–13:00 区间 2 的
+300 lux 最亮，区间 1 该小时被遮蔽；总量 450 = 50×2 + 300×1 + 50×1）：
+
+```json
+{
+  "showcase_id": 1,
+  "showcase_name": "敦煌展厅A柜",
+  "start": "2026-09-18T10:00:00Z",
+  "end": "2026-09-18T14:00:00Z",
+  "total_lux_hours": 450.0,
+  "intervals": [
+    {"interval_id": 1, "attributed_lux_hours": 150.0, "shadowed_hours": 1.0},
+    {"interval_id": 2, "attributed_lux_hours": 300.0, "shadowed_hours": 0.0}
+  ]
+}
+```
+
 ## 计算规则
 
 - **时间线合并**：把展柜所有区间的开/关灯时刻作为事件扫描；任意时刻有多盏灯亮，有效照度取
@@ -258,6 +285,13 @@ curl -s -X POST localhost:8000/api/v1/showcases/1/open-hours-coverage \
   `gaps` 返回，同时给出每日 `compliant_hours`（达标小时数）与 `compliant_ratio`
   （= 达标小时数 / 开放时长）。**照度恰好等于门槛视为达标**；完全无灯时整个开放窗口是一个
   缺口、达标比例为 0。全程只读，不改动已存区间。
+- **区间曝光归因**：`POST .../interval-attribution` 传入查询窗口起止时刻（UTC 归一化后须
+  起点早于终点、跨度不超过 31 天，闭开窗口 [start, end)），只读取出与窗口相交的既有照明
+  区间并裁剪跨界部分；按所有起止点把窗口切片，每片有效照度取最大值，该片有效 lux·hour
+  平分给照度**并列最高且大于零**的区间（较暗区间不获归因，其被更亮区间覆盖的片长计入
+  `shadowed_hours`）。返回窗口有效曝光总量 `total_lux_hours` 与每条相交区间的
+  `interval_id`、`attributed_lux_hours`、`shadowed_hours`（按 ID 排序）；窗口内无相交
+  区间时总量为零、列表为空。全程只读，不改动已存区间。
 - **时间**：接受带时区 ISO 8601；naive 时间视为 UTC；内部统一 UTC 存储与返回。
 
 ### 敏感度默认年度上限
@@ -277,6 +311,7 @@ curl -s -X POST localhost:8000/api/v1/showcases/1/open-hours-coverage \
 - **安全照度上限时段**：UTC 归一化后 `end <= start`，或起止时间不处于同一公历年 → `422`。
 - **巡检范围**：结束日期早于开始日期、日期跨度超过 7 天（含两端）、开放结束时刻不晚于
   开始时刻（含跨午夜形态）、`min_lux <= 0` → `422`。
+- **归因窗口**：UTC 归一化后 `end <= start`，或窗口跨度超过 31 天 → `422`。
 - **未知展品 / 未知展柜**：查询或向不存在的展柜提交数据 → `404`。
 - **试算撤去项**：`remove_interval_ids` 含不存在或不属于该展柜的区间 ID → `404`。
 - 非有限数值（NaN / Infinity）→ `422`；重名冲突 → `409`。
@@ -298,6 +333,7 @@ curl -s -X POST localhost:8000/api/v1/showcases/1/open-hours-coverage \
 | POST | `/api/v1/showcases/{id}/lighting-preview` | **照明调整试算**（撤去/新增区间，不落库） |
 | POST | `/api/v1/showcases/{id}/safe-lux-limit` | **安全照度上限**（计划时段可追加的最大整数照度，不落库） |
 | POST | `/api/v1/showcases/{id}/open-hours-coverage` | **开放时段照明覆盖巡检**（逐日缺口/达标小时数/达标比例，不落库） |
+| POST | `/api/v1/showcases/{id}/interval-attribution` | **区间曝光归因**（窗口有效曝光平摊给并列最亮区间，不落库） |
 | GET | `/api/v1/showcases/{id}/intervals?day=YYYY-MM-DD` | 区间查询，**可按日期过滤** |
 | GET | `/api/v1/showcases/{id}/budget?day=YYYY-MM-DD` | **按展柜 + 日期查预算** |
 | GET | `/api/v1/exhibits/{id}/budget?day=YYYY-MM-DD` | 按单件展品查预算 |
@@ -318,7 +354,7 @@ app/
 └── routers/
     ├── showcases.py   # 展柜 / 展品 / 照明区间
     └── reports.py     # 预算查询
-tests/                 # pytest：算法单测 + API 集成测试（47 项）
+tests/                 # pytest：算法单测 + API 集成测试（57 项）
 Dockerfile             # python:3.12-slim + HEALTHCHECK
 docker-compose.yml     # 单命令启动 + 数据卷
 ```
@@ -333,4 +369,5 @@ pytest -q
 覆盖：重叠取 max、多灯合并、首尾相接、跨年裁剪、超标插值、恰好到限不超标、负照度/反向区间/
 未知展柜拒绝、按日期过滤、安全照度上限（二分最大整数照度、瓶颈展品、现状超限不可行、跨年
 时段拒绝、只读性）、开放时段巡检（缺口合并、跨日区间裁剪、恰好达到门槛、完全无灯、范围与
-门槛校验、只读性）、重启持久化等。
+门槛校验、只读性）、区间曝光归因（切片取 max、并列最亮平分、较暗区间遮蔽计时、零照度不归因、
+跨界裁剪、31 天窗口校验、只读性）、重启持久化等。

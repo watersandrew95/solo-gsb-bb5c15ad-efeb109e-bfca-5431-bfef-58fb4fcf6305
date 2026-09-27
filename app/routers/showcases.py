@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from ..budget import (
     build_exhibit_preview,
+    build_interval_attribution,
     build_open_hours_coverage,
     build_safe_lux_limit,
     load_case_intervals,
@@ -19,6 +20,8 @@ from ..schemas import (
     ExhibitCreate,
     ExhibitOut,
     ExhibitUpdate,
+    IntervalAttributionIn,
+    IntervalAttributionOut,
     LightIntervalBulk,
     LightIntervalOut,
     LightingPreviewIn,
@@ -293,3 +296,17 @@ def open_hours_coverage(showcase_id: int, body: OpenHoursCoverageIn, conn=Depend
     )
     intervals = load_intervals_in_range(conn, showcase_id, range_start, range_end)
     return build_open_hours_coverage(showcase, intervals, body)
+
+
+# ------------------------------------------------------------- 区间曝光归因
+
+@router.post(
+    "/showcases/{showcase_id}/interval-attribution",
+    response_model=IntervalAttributionOut,
+    summary="区间曝光归因：窗口有效曝光平摊给并列最亮的照明区间（只读，不落库）",
+)
+def interval_attribution(showcase_id: int, body: IntervalAttributionIn, conn=Depends(get_db)):
+    showcase = _get_showcase(conn, showcase_id)
+    # 只读查询与窗口相交的既有区间；跨界部分由归因算法裁剪到窗口内
+    intervals = load_intervals_in_range(conn, showcase_id, body.start, body.end)
+    return build_interval_attribution(showcase, intervals, body.start, body.end)
