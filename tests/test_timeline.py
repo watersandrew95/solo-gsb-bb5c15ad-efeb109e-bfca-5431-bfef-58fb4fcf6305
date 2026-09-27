@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.timeline import (
     Segment,
+    attribute_exposure,
     clip_segments,
     coverage_gaps,
     first_exceed_time,
@@ -132,3 +133,65 @@ def test_coverage_gaps_clips_cross_day_segment_to_window():
     gaps, compliant = coverage_gaps(segs, _dt(8, day=2), _dt(12, day=2), 50)
     assert gaps == [(_dt(10, day=2), _dt(12, day=2))]
     assert compliant == 2.0
+
+
+# ------------------------------------------------------------- 曝光归因
+
+def test_attribute_exposure_overlap_takes_max_and_shadows():
+    # A: 08-18 @50；B: 10-12 @200 → 重叠段取 max，A 被遮蔽 2 小时
+    total, attrs = attribute_exposure(
+        [(1, _dt(8), _dt(18), 50), (2, _dt(10), _dt(12), 200)], _dt(8), _dt(18)
+    )
+    assert total == 50 * 2 + 200 * 2 + 50 * 6
+    by_id = {a.interval_id: a for a in attrs}
+    assert by_id[1].lux_hours == 50 * 2 + 50 * 6
+    assert by_id[1].shadowed_hours == 2.0
+    assert by_id[2].lux_hours == 200 * 2
+    assert by_id[2].shadowed_hours == 0.0
+
+
+def test_attribute_exposure_tied_brightest_split_evenly():
+    # 两条 100 lux 并列最亮：该片的 200 lux·h 平分；50 lux 不获归因只记遮蔽
+    total, attrs = attribute_exposure(
+        [
+            (1, _dt(10), _dt(12), 100),
+            (2, _dt(10), _dt(12), 100),
+            (3, _dt(10), _dt(12), 50),
+        ],
+        _dt(8),
+        _dt(18),
+    )
+    assert total == 200.0
+    by_id = {a.interval_id: a for a in attrs}
+    assert by_id[1].lux_hours == 100.0
+    assert by_id[2].lux_hours == 100.0
+    assert by_id[3].lux_hours == 0.0
+    assert by_id[3].shadowed_hours == 2.0
+
+
+def test_attribute_exposure_clips_cross_boundary_intervals():
+    # 跨界区间只计入窗口内部分；窗口外部分不产生归因与遮蔽
+    total, attrs = attribute_exposure(
+        [(1, _dt(20), _dt(10, day=2), 80), (2, _dt(21), _dt(23), 30)],
+        _dt(22),
+        _dt(23),
+    )
+    assert total == 80.0
+    by_id = {a.interval_id: a for a in attrs}
+    assert by_id[1].lux_hours == 80.0
+    assert by_id[1].shadowed_hours == 0.0
+    assert by_id[2].lux_hours == 0.0
+    assert by_id[2].shadowed_hours == 1.0
+
+
+def test_attribute_exposure_zero_lux_and_empty_window():
+    # 0 lux 区间相交但不获归因也不被遮蔽；窗口内无区间时总量为 0、列表为空
+    total, attrs = attribute_exposure([(1, _dt(8), _dt(10), 0)], _dt(8), _dt(18))
+    assert total == 0.0
+    assert [a.interval_id for a in attrs] == [1]
+    assert attrs[0].lux_hours == 0.0
+    assert attrs[0].shadowed_hours == 0.0
+
+    total, attrs = attribute_exposure([], _dt(8), _dt(18))
+    assert total == 0.0
+    assert attrs == []

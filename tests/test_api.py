@@ -814,3 +814,161 @@ def test_open_hours_coverage_read_only_and_tz_normalized(client):
     assert client.get(
         f"/api/v1/showcases/{case_id}/budget?day=2026-03-01").json() == before_budget
     assert client.get(f"/api/v1/showcases/{case_id}/intervals").json() == before_intervals
+
+
+# ------------------------------------------------------------- 窗口曝光归因
+
+def _post_attribution(client, case_id, **overrides):
+    payload = {"start": "2026-03-01T08:00:00Z", "end": "2026-03-01T18:00:00Z"}
+    payload.update(overrides)
+    return client.post(f"/api/v1/showcases/{case_id}/interval-attribution", json=payload)
+
+
+def test_interval_attribution_overlap_and_shadowing(client):
+    """A: 08-18 @50；B: 10-12 @200（重叠取 max，B 遮蔽 A 两小时）。
+
+    切片 08-10 / 10-12 / 12-18：A 获 50*2+50*6=400，B 获 200*2=400；总量 800。
+    """
+    case_id = _create_case(client, name="归因柜")
+    r = client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            {"start": "2026-03-01T08:00:00Z", "end": "2026-03-01T18:00:00Z", "lux": 50},
+            {"start": "2026-03-01T10:00:00Z", "end": "2026-03-01T12:00:00Z", "lux": 200},
+        ]},
+    )
+    assert r.status_code == 201, r.text
+    ids = [iv["id"] for iv in r.json()]
+
+    r = _post_attribution(client, case_id)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["showcase_id"] == case_id
+    assert body["showcase_name"] == "归因柜"
+    assert body["total_lux_hours"] == 800.0
+    items = body["intervals"]
+    assert [it["interval_id"] for it in items] == ids  # 按 ID 排序
+    assert items[0]["attributed_lux_hours"] == 400.0
+    assert items[0]["shadowed_hours"] == 2.0
+    assert items[1]["attributed_lux_hours"] == 400.0
+    assert items[1]["shadowed_hours"] == 0.0
+
+
+def test_interval_attribution_tied_brightest_split_and_clipping(client):
+    """并列最亮平分、跨界裁剪、较暗区间不获归因只记遮蔽。
+
+    窗口 09:00-11:00；区间：
+      A 08:00-12:00 @100（跨界裁剪为 09-11）
+      B 10:00-12:00 @100（与 A 在 10-11 并列最亮）
+      C 09:30-10:30 @40（全程被遮蔽）
+    09:00-09:30 A 独亮 → 50；09:30-10:00 A 最亮 → 50（C 遮蔽 0.5h）；
+    10:00-10:30 与 10:30-11:00 A、B 并列 → 各分 25（C 再遮蔽 0.5h）。
+    A 共 150，B 共 50，C 0、遮蔽 1h；总量 200。
+    """
+    case_id = _create_case(client, name="归因并列柜")
+    r = client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            {"start": "2026-03-01T08:00:00Z", "end": "2026-03-01T12:00:00Z", "lux": 100},
+            {"start": "2026-03-01T10:00:00Z", "end": "2026-03-01T12:00:00Z", "lux": 100},
+            {"start": "2026-03-01T09:30:00Z", "end": "2026-03-01T10:30:00Z", "lux": 40},
+        ]},
+    )
+    ids = [iv["id"] for iv in r.json()]
+
+    r = _post_attribution(
+        client, case_id, start="2026-03-01T09:00:00Z", end="2026-03-01T11:00:00Z"
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["total_lux_hours"] == 200.0
+    items = {it["interval_id"]: it for it in body["intervals"]}
+    assert items[ids[0]]["attributed_lux_hours"] == 150.0
+    assert items[ids[0]]["shadowed_hours"] == 0.0
+    assert items[ids[1]]["attributed_lux_hours"] == 50.0
+    assert items[ids[1]]["shadowed_hours"] == 0.0
+    assert items[ids[2]]["attributed_lux_hours"] == 0.0
+    assert items[ids[2]]["shadowed_hours"] == 1.0
+
+
+def test_interval_attribution_empty_and_zero_lux(client):
+    """无相交区间：总量 0、列表为空；0 lux 区间相交但不获归因也不被遮蔽。"""
+    case_id = _create_case(client, name="归因空柜")
+    r = _post_attribution(client, case_id)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["total_lux_hours"] == 0.0
+    assert body["intervals"] == []
+
+    client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            {"start": "2026-03-01T09:00:00Z", "end": "2026-03-01T10:00:00Z", "lux": 0}
+        ]},
+    )
+    body = _post_attribution(client, case_id).json()
+    assert body["total_lux_hours"] == 0.0
+    assert len(body["intervals"]) == 1
+    assert body["intervals"][0]["attributed_lux_hours"] == 0.0
+    assert body["intervals"][0]["shadowed_hours"] == 0.0
+
+
+def test_interval_attribution_validation(client):
+    """反向 / 零长度 / 超过 31 天 → 422；恰好 31 天通过；未知展柜 → 404。"""
+    case_id = _create_case(client, name="归因校验柜")
+
+    # 反向窗口
+    r = _post_attribution(
+        client, case_id,
+        start="2026-03-02T08:00:00Z", end="2026-03-01T08:00:00Z",
+    )
+    assert r.status_code == 422 and "结束时间" in r.text
+    # 零长度窗口
+    r = _post_attribution(
+        client, case_id,
+        start="2026-03-01T08:00:00Z", end="2026-03-01T08:00:00Z",
+    )
+    assert r.status_code == 422
+    # 跨度 32 天 > 31 天
+    r = _post_attribution(
+        client, case_id,
+        start="2026-03-01T00:00:00Z", end="2026-04-02T00:00:00Z",
+    )
+    assert r.status_code == 422 and "31" in r.text
+    # 恰好 31 天 → 通过
+    r = _post_attribution(
+        client, case_id,
+        start="2026-03-01T00:00:00Z", end="2026-04-01T00:00:00Z",
+    )
+    assert r.status_code == 200, r.text
+    # 未知展柜
+    r = _post_attribution(client, 4242)
+    assert r.status_code == 404
+
+
+def test_interval_attribution_read_only_and_tz_normalized(client):
+    """naive 时间视为 UTC、带时区时间归一化为 UTC 返回；全程只读不改库。"""
+    case_id = _create_case(client, name="归因只读柜")
+    client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            {"start": "2026-03-01T08:00:00Z", "end": "2026-03-01T18:00:00Z", "lux": 50}
+        ]},
+    )
+    before_intervals = client.get(f"/api/v1/showcases/{case_id}/intervals").json()
+
+    # naive 起 + 带时区止：2026-03-01 20:00 (+02:00) → UTC 18:00
+    r = _post_attribution(
+        client, case_id,
+        start="2026-03-01T08:00:00", end="2026-03-01T20:00:00+02:00",
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["start"].startswith("2026-03-01T08:00:00")
+    assert body["end"].startswith("2026-03-01T18:00:00")
+    assert body["start"].endswith(("+00:00", "Z"))
+    assert body["end"].endswith(("+00:00", "Z"))
+    assert body["total_lux_hours"] == 500.0
+
+    # 只读：已存区间不变
+    assert client.get(f"/api/v1/showcases/{case_id}/intervals").json() == before_intervals

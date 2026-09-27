@@ -133,6 +133,75 @@ def coverage_gaps(
     return gaps, compliant_hours
 
 
+@dataclass(frozen=True)
+class Attribution:
+    """单条照明区间在归因窗口内分得的曝光与被遮蔽时长。"""
+
+    interval_id: int
+    lux_hours: float
+    shadowed_hours: float
+
+
+def attribute_exposure(
+    intervals: list[tuple[int, datetime, datetime, float]],
+    window_start: datetime,
+    window_end: datetime,
+) -> tuple[float, list[Attribution]]:
+    """把 [window_start, window_end) 窗口内的有效曝光归因到各照明区间。
+
+    跨界区间先裁剪到窗口内，再按所有区间的起止点把时间轴切片；每片有效
+    照度取该片最大值，该片的 lux·hour 平分给照度并列最高且大于零的区间
+    （较暗区间不获归因，只累计"被更亮区间遮蔽"的小时数）。
+
+    返回 ``(窗口有效曝光总量, 按区间 ID 排序的归因列表)``；窗口内无相交
+    区间时总量为 0、列表为空。
+    """
+    window_start, window_end = parse_utc(window_start), parse_utc(window_end)
+    clipped: list[tuple[int, datetime, datetime, float]] = []
+    points: set[datetime] = set()
+    for interval_id, start, end, lux in intervals:
+        seg_start = max(parse_utc(start), window_start)
+        seg_end = min(parse_utc(end), window_end)
+        if seg_end > seg_start:
+            clipped.append((interval_id, seg_start, seg_end, lux))
+            points.add(seg_start)
+            points.add(seg_end)
+
+    attributed: dict[int, float] = {interval_id: 0.0 for interval_id, *_ in clipped}
+    shadowed: dict[int, float] = {interval_id: 0.0 for interval_id, *_ in clipped}
+    total = 0.0
+
+    ordered = sorted(points)
+    for seg_start, seg_end in zip(ordered, ordered[1:]):
+        # 切片边界取自区间起止点，区间内要么完整覆盖该片、要么完全不沾边
+        active = [
+            (interval_id, lux)
+            for interval_id, start, end, lux in clipped
+            if start <= seg_start and seg_end <= end
+        ]
+        if not active:
+            continue
+        duration_h = hours_between(seg_start, seg_end)
+        max_lux = max(lux for _, lux in active)
+        exposure = max_lux * duration_h
+        total += exposure
+        winners = [
+            interval_id for interval_id, lux in active if lux == max_lux and lux > 0
+        ]
+        if winners:
+            share = exposure / len(winners)
+            for interval_id in winners:
+                attributed[interval_id] += share
+        for interval_id, lux in active:
+            if lux < max_lux:
+                shadowed[interval_id] += duration_h
+
+    return total, [
+        Attribution(interval_id, attributed[interval_id], shadowed[interval_id])
+        for interval_id in sorted(attributed)
+    ]
+
+
 def integrate(segments: list[Segment]) -> float:
     """累计 lux·hour。"""
     return sum(seg.lux * hours_between(seg.start, seg.end) for seg in segments)

@@ -7,7 +7,7 @@
 """
 from __future__ import annotations
 
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from enum import Enum
 from typing import Optional
 
@@ -298,6 +298,58 @@ class OpenHoursCoverageOut(BaseModel):
     open_end: time
     min_lux: float
     days: list[OpenHoursCoverageDayOut]
+
+
+# 曝光归因窗口的最大跨度（天）
+MAX_ATTRIBUTION_WINDOW_DAYS = 31
+
+
+class IntervalAttributionIn(BaseModel):
+    """曝光归因请求：待归因的时间窗口（闭开区间 [start, end)）。
+
+    归一化到 UTC 后要求起点早于终点（正向窗口），且跨度不超过 31 天。
+    """
+
+    start: datetime = Field(description="归因窗口开始时间；不带时区视为 UTC")
+    end: datetime = Field(description="归因窗口结束时间；不带时区视为 UTC")
+
+    @model_validator(mode="after")
+    def _check_range(self) -> "IntervalAttributionIn":
+        start, end = to_utc(self.start), to_utc(self.end)
+        if end <= start:
+            raise ValueError("归因窗口结束时间必须晚于开始时间（不接受反向或零长度窗口）")
+        if end - start > timedelta(days=MAX_ATTRIBUTION_WINDOW_DAYS):
+            raise ValueError(
+                f"归因窗口跨度最长 {MAX_ATTRIBUTION_WINDOW_DAYS} 天（UTC 归一化后）"
+            )
+        self.start, self.end = start, end
+        return self
+
+
+class IntervalAttributionItemOut(BaseModel):
+    """单条相交照明区间的归因结果。"""
+
+    interval_id: int
+    attributed_lux_hours: float = Field(
+        description="归因 lux·hour：窗口内该区间作为并列最亮者（照度 > 0）分得的曝光"
+    )
+    shadowed_hours: float = Field(
+        description="被遮蔽小时数：窗口内该区间亮着但被更亮区间压制的累计时长"
+    )
+
+
+class IntervalAttributionOut(BaseModel):
+    showcase_id: int
+    showcase_name: str
+    start: datetime = Field(description="归一化到 UTC 的归因窗口起点")
+    end: datetime = Field(description="归一化到 UTC 的归因窗口终点")
+    total_lux_hours: float = Field(
+        description="窗口内有效曝光总量（lux·hour）；窗口内无照明记录时为 0"
+    )
+    intervals: list[IntervalAttributionItemOut] = Field(
+        default_factory=list,
+        description="按区间 ID 排序的逐区间归因；无相交区间时为空",
+    )
 
 
 class ExhibitBudgetOut(BaseModel):

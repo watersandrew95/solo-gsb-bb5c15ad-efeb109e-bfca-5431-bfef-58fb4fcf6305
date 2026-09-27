@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from ..budget import (
     build_exhibit_preview,
+    build_interval_attribution,
     build_open_hours_coverage,
     build_safe_lux_limit,
     load_case_intervals,
@@ -19,6 +20,8 @@ from ..schemas import (
     ExhibitCreate,
     ExhibitOut,
     ExhibitUpdate,
+    IntervalAttributionIn,
+    IntervalAttributionOut,
     LightIntervalBulk,
     LightIntervalOut,
     LightingPreviewIn,
@@ -293,3 +296,17 @@ def open_hours_coverage(showcase_id: int, body: OpenHoursCoverageIn, conn=Depend
     )
     intervals = load_intervals_in_range(conn, showcase_id, range_start, range_end)
     return build_open_hours_coverage(showcase, intervals, body)
+
+
+# ------------------------------------------------------------- 窗口曝光归因
+
+@router.post(
+    "/showcases/{showcase_id}/interval-attribution",
+    response_model=IntervalAttributionOut,
+    summary="窗口曝光归因：有效曝光平分给并列最亮区间，较暗区间记遮蔽时长（只读，不落库）",
+)
+def interval_attribution(showcase_id: int, body: IntervalAttributionIn, conn=Depends(get_db)):
+    showcase = _get_showcase(conn, showcase_id)
+    # 请求模型已保证 UTC 下为正向且不超过 31 天的闭开窗口
+    intervals = load_intervals_in_range(conn, showcase_id, body.start, body.end)
+    return build_interval_attribution(showcase, intervals, body.start, body.end)
